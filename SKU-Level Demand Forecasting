@@ -1,0 +1,369 @@
+import pandas as pd
+import numpy as np
+from lightgbm import LGBMClassifier
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import accuracy_score, f1_score
+from datetime import datetime, timedelta
+from collections import defaultdict
+from IPython.display import FileLink
+
+# Input parameters
+start_date_str = input("Enter start date (YYYY-MM-DD): ")
+end_date_str = input("Enter end date (YYYY-MM-DD): ")
+
+# Convert input dates to datetime
+start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+
+# Generate date range
+date_range = [start_date + timedelta(days=x) for x in range((end_date - start_date).days + 1)]
+days = [date.strftime('%A') for date in date_range]  # Day names for the range
+
+# Get unique customer_ids from sorted_df
+customer_ids = sorted_df['customer_id'].unique()
+
+# Define fixed threshold value for order prediction
+order_threshold = 0.2
+
+# Initialize a list to store all predictions
+all_predictions = []
+
+# Fit LabelEncoder on all possible days once (for consistency)
+day_encoder = LabelEncoder()
+day_encoder.fit(days)  # Fit on the days in the prediction range
+
+# Pre-fit LabelEncoders for day_of_week, month, and week_of_year using full possible ranges
+le_day_of_week = LabelEncoder()
+le_day_of_week.fit(range(7))  # Fit on 0-6 (all days of the week)
+le_month = LabelEncoder()
+le_month.fit(range(1, 13))  # Fit on 1-12 (all months)
+le_week_of_year = LabelEncoder()
+le_week_of_year.fit(range(1, 53))  # Fit on 1-52 (all weeks of the year)
+
+# Precompute customer features
+def precompute_customer_features(customer_data):
+    if customer_data.empty:
+        return 0, 0
+    order_dates = pd.to_datetime(customer_data['order_date'])
+    order_freq = order_dates.nunique() / ((order_dates.max() - order_dates.min()).days + 1) if order_dates.nunique() > 0 else 0
+    total_orders = order_dates.nunique()
+    return order_freq, total_orders
+
+# Process each customer_id
+for customer_id in customer_ids:
+    print(f"Processing customer_id: {customer_id}")
+    # Filter data for the given customer_id
+    customer_data = sorted_df[sorted_df['customer_id'] == customer_id].copy()
+    print(f"customer_data columns: {customer_data.columns.tolist()}")
+    print(f"customer_data head:\n{customer_data.head()}")
+
+    # Precompute customer-specific features
+    order_freq, total_orders = precompute_customer_features(customer_data)
+    customer_data['order_date'] = pd.to_datetime(customer_data['order_date'])
+    first_order_date = customer_data['order_date'].min() if not customer_data.empty else start_date
+    customer_data['days_since_first_order'] = (customer_data['order_date'] - first_order_date).dt.days
+    customer_data['day_of_week'] = customer_data['order_date'].dt.weekday
+    customer_data['month'] = customer_data['order_date'].dt.month
+    customer_data['week_of_year'] = customer_data['order_date'].dt.isocalendar().week
+
+    # Create historical dataset with enhanced features
+    historical_dates = pd.date_range(
+        start=customer_data['order_date'].min() if not customer_data.empty else start_date,
+        end=customer_data['order_date'].max() if not customer_data.empty else end_date,
+        freq='D'
+    )
+    historical_df = pd.DataFrame({
+        'date': historical_dates,
+        'day_name': [d.strftime('%A') for d in historical_dates],
+        'ordered': [1 if pd.to_datetime(d).date() in customer_data['order_date'].dt.date.values else 0
+                    for d in historical_dates],
+        'order_frequency': [order_freq] * len(historical_dates),
+        'total_orders': [total_orders] * len(historical_dates),
+        'day_of_week': [d.weekday() for d in historical_dates],
+        'month': [d.month for d in historical_dates],
+        'week_of_year': [d.isocalendar().week for d in historical_dates]
+    })
+
+    # Add missing features
+    historical_df['days_since_first_order'] = (historical_df['date'] - first_order_date).dt.days
+    historical_df['ordered_yesterday'] = historical_df['ordered'].shift(1).fillna(0)
+
+    # Debug: Check data types and sample size
+    print(f"historical_df['day_of_week'] type: {historical_df['day_of_week'].dtype}")
+    print(f"historical_df['month'] type: {historical_df['month'].dtype}")
+    print(f"historical_df['week_of_year'] type: {historical_df['week_of_year'].dtype}")
+    print(f"Number of samples for customer {customer_id}: {len(historical_df)}")
+    print(f"Class distribution for customer {customer_id}: {historical_df['ordered'].value_counts()}")
+
+    # Check if there’s enough data to train
+    if len(historical_df) < 2 or customer_data.empty:
+        print(f"Insufficient data for customer {customer_id}. Skipping prediction.")
+        prediction_df = pd.DataFrame({
+            'customer_id': [customer_id] * len(date_range),
+            'date': date_range,
+            'day_name': days,
+            'probability_of_order': [0.0] * len(date_range),
+            'predicted_order': [0] * len(date_range),
+            'predicted_items_quantities': [None] * len(date_range),
+            'cumulative_predicted_items': [None] * len(date_range)
+        })
+    else:
+        # Encode categorical features using pre-fitted encoders
+        historical_df['day_name_encoded'] = day_encoder.transform(historical_df['day_name'])
+        historical_df['day_of_week_encoded'] = le_day_of_week.transform(historical_df['day_of_week'].astype(int))
+        historical_df['month_encoded'] = le_month.transform(historical_df['month'].astype(int))
+        historical_df['week_of_year_encoded'] = le_week_of_year.transform(historical_df['week_of_year'].astype(int))
+
+        # Prepare features and target for order prediction
+        X_order = historical_df[['day_name_encoded', 'days_since_first_order', 'ordered_yesterday', 'order_frequency',
+                               'total_orders', 'day_of_week_encoded', 'month_encoded', 'week_of_year_encoded']]
+        y_order = historical_df['ordered']
+
+        # Split data for order prediction
+        X_train_order, X_test_order, y_train_order, y_test_order = train_test_split(X_order, y_order, test_size=0.2, random_state=42)
+
+        # Train LightGBM model for order prediction with improved parameters
+        order_model = LGBMClassifier(random_state=42, verbose=-1, max_depth=7, lambda_l2=1.0, n_estimators=200, class_weight='balanced')
+        order_model.fit(X_train_order, y_train_order)
+
+        # Dynamic cross-validation based on class distribution
+        n_samples = len(X_order)
+        cv_folds = min(5, n_samples)  # Use at most 5 folds
+        if n_samples >= 2:
+            # Get class counts
+            class_counts = historical_df['ordered'].value_counts()
+            min_class_samples = class_counts.min() if not class_counts.empty else 0
+            cv_folds = min(cv_folds, min_class_samples)  # Limit folds by minority class size
+            if cv_folds >= 2:  # Minimum for meaningful CV
+                cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+                cv_scores = cross_val_score(order_model, X_order, y_order, cv=cv, scoring='f1')
+                print(f"Cross-validation F1-score for customer {customer_id}: {cv_scores.mean():.3f} (+/- {cv_scores.std() * 2:.3f})")
+            else:
+                print(f"Insufficient samples per class ({min_class_samples}) for {cv_folds}-fold cross-validation for customer {customer_id}. Skipping CV.")
+        else:
+            print(f"Insufficient samples ({n_samples}) for cross-validation for customer {customer_id}. Skipping CV.")
+
+        # Evaluate on test set if test data exists
+        if len(X_test_order) > 0:
+            y_pred_order = order_model.predict(X_test_order)
+            print(f"Test set accuracy: {accuracy_score(y_test_order, y_pred_order):.3f}")
+            print(f"Test set F1-score: {f1_score(y_test_order, y_pred_order):.3f}")
+        else:
+            print(f"No test data available for customer {customer_id}. Skipping test evaluation.")
+
+        # Prepare prediction dataset
+        prediction_df = pd.DataFrame({
+            'customer_id': [customer_id] * len(date_range),
+            'date': date_range,
+            'day_name': days
+        })
+        prediction_df['day_name_encoded'] = day_encoder.transform(prediction_df['day_name'])
+        prediction_df['days_since_first_order'] = (prediction_df['date'] - first_order_date).dt.days
+        prediction_df['ordered_yesterday'] = 0  # Assume no order before start date
+        prediction_df['order_frequency'] = order_freq
+        prediction_df['total_orders'] = total_orders
+        prediction_df['day_of_week'] = [d.weekday() for d in date_range]
+        prediction_df['month'] = [d.month for d in date_range]
+        prediction_df['week_of_year'] = [d.isocalendar().week for d in date_range]
+        prediction_df['day_of_week_encoded'] = le_day_of_week.transform(prediction_df['day_of_week'].astype(int))
+        prediction_df['month_encoded'] = le_month.transform(prediction_df['month'].astype(int))
+        prediction_df['week_of_year_encoded'] = le_week_of_year.transform(prediction_df['week_of_year'].astype(int))
+
+        # Predict probabilities
+        X_pred_order = prediction_df[['day_name_encoded', 'days_since_first_order', 'ordered_yesterday', 'order_frequency',
+                                    'total_orders', 'day_of_week_encoded', 'month_encoded', 'week_of_year_encoded']]
+        probabilities = order_model.predict_proba(X_pred_order)[:, 1]
+        print(f"Probabilities for customer {customer_id}: {probabilities}")
+        predicted_orders = [1 if p == 1.0 else (1 if p >= order_threshold else 0) for p in probabilities]
+        prediction_df['probability_of_order'] = probabilities
+        prediction_df['predicted_order'] = predicted_orders
+
+        # Product and Quantity Prediction using sorted_df
+        customer_sorted_data = sorted_df[sorted_df['customer_id'] == customer_id].copy()
+        print(f"customer_sorted_data columns: {customer_sorted_data.columns.tolist()}")
+        print(f"customer_sorted_data head:\n{customer_sorted_data.head()}")
+        if not customer_sorted_data.empty and 'item_name' in customer_sorted_data.columns and 'quantity' in customer_sorted_data.columns:
+            # Feature Engineering for product and quantity prediction
+            customer_sorted_data['order_date'] = pd.to_datetime(customer_sorted_data['order_date'])
+            customer_sorted_data['days_since_first_order'] = (customer_sorted_data['order_date'] - first_order_date).dt.days
+            customer_sorted_data['day_name'] = customer_sorted_data['order_date'].dt.day_name()
+            customer_sorted_data['day_name_encoded'] = day_encoder.transform(customer_sorted_data['day_name'])
+            customer_sorted_data['day_of_week'] = customer_sorted_data['order_date'].dt.weekday
+            customer_sorted_data['month'] = customer_sorted_data['order_date'].dt.month
+            customer_sorted_data['week_of_year'] = customer_sorted_data['order_date'].dt.isocalendar().week
+            customer_sorted_data = customer_sorted_data.merge(historical_df[['date', 'ordered_yesterday']],
+                                                           left_on='order_date',
+                                                           right_on='date',
+                                                           how='left').fillna({'ordered_yesterday': 0})
+            customer_sorted_data['order_frequency'] = order_freq
+            customer_sorted_data['total_orders'] = total_orders
+
+            # Prepare product and quantity prediction data
+            X_product = customer_sorted_data[['day_name_encoded', 'days_since_first_order', 'ordered_yesterday', 'order_frequency',
+                                            'total_orders', 'day_of_week', 'month', 'week_of_year']]
+            y_product = customer_sorted_data['item_name']
+            y_quantity = customer_sorted_data['quantity']
+
+            # Verify target data
+            print(f"y_product unique values: {y_product.unique()}")
+            print(f"y_quantity unique values: {y_quantity.unique()}")
+            if y_product.empty or y_quantity.empty:
+                print(f"Warning: No valid target data for customer {customer_id}. Skipping prediction.")
+                prediction_df['predicted_items_quantities'] = None
+                prediction_df['cumulative_predicted_items'] = None
+                continue
+
+            # Train the RandomForestClassifier for item prediction with improved parameters
+            item_model = RandomForestClassifier(random_state=42, n_estimators=200, max_depth=10)
+            try:
+                item_model.fit(X_product, y_product)
+            except ValueError as e:
+                print(f"Error fitting item_model for customer {customer_id}: {e}")
+                prediction_df['predicted_items_quantities'] = None
+                prediction_df['cumulative_predicted_items'] = None
+                continue
+
+            # Train the RandomForestRegressor for quantity prediction with improved parameters
+            quantity_model = RandomForestRegressor(random_state=42, n_estimators=200, max_depth=10)
+            try:
+                quantity_model.fit(X_product, y_quantity)
+            except ValueError as e:
+                print(f"Error fitting quantity_model for customer {customer_id}: {e}")
+                prediction_df['predicted_items_quantities'] = None
+                prediction_df['cumulative_predicted_items'] = None
+                continue
+
+            # Predict multiple items and quantities for days with orders
+            cumulative_items = set()
+            for index in prediction_df.index:
+                if prediction_df.loc[index, 'predicted_order'] == 1:
+                    # Prepare the prediction row
+                    X_pred_item = pd.DataFrame([prediction_df.loc[index, ['day_name_encoded', 'days_since_first_order', 'ordered_yesterday',
+                                                                       'order_frequency', 'total_orders', 'day_of_week_encoded',
+                                                                       'month_encoded', 'week_of_year_encoded']]],
+                                             columns=X_product.columns)
+                    # Simulate multiple orders (e.g., up to 3 items based on historical max)
+                    max_orders_per_day = min(3, customer_sorted_data.groupby('order_date').size().max() if not customer_sorted_data.groupby('order_date').size().empty else 1)
+                    num_orders = np.random.randint(1, max_orders_per_day + 1)
+                    predicted_items = []
+                    predicted_quantities = []
+                    for _ in range(num_orders):
+                        predicted_item = item_model.predict(X_pred_item)[0]
+                        predicted_quantity = max(1, int(quantity_model.predict(X_pred_item)[0]))
+                        predicted_items.append(predicted_item)
+                        predicted_quantities.append(predicted_quantity)
+
+                    # Store as a list of (item, quantity) tuples with explicit handling
+                    items_quantities = list(zip(predicted_items, predicted_quantities))
+                    try:
+                        prediction_df.at[index, 'predicted_items_quantities'] = items_quantities
+                        cumulative_items.update(predicted_items)
+                    except ValueError as e:
+                        print(f"Error assigning predicted_items_quantities at index {index} for customer {customer_id}: {e}")
+                        prediction_df.at[index, 'predicted_items_quantities'] = None
+                else:
+                    prediction_df.at[index, 'predicted_items_quantities'] = None
+                prediction_df.at[index, 'cumulative_predicted_items'] = list(cumulative_items) if cumulative_items else None
+        else:
+            prediction_df['predicted_items_quantities'] = None
+            prediction_df['cumulative_predicted_items'] = None
+
+    # Append predictions
+    all_predictions.append(prediction_df)
+
+# Combine all predictions
+all_predictions_df = pd.concat(all_predictions, ignore_index=True)
+
+# Convert predicted_items_quantities to string for Excel compatibility
+all_predictions_df['predicted_items_quantities'] = all_predictions_df['predicted_items_quantities'].apply(
+    lambda x: str(x) if x is not None else None
+)
+
+# Save to Excel
+output_filename = 'customer_order_item_predictions_demo2.xlsx'
+all_predictions_df.to_excel(output_filename, index=False)
+print(f"Predictions saved to {output_filename}")
+display(FileLink(output_filename))
+
+df1.to_excel('Processed_order_data_final.xlsx', index=False)
+import pandas as pd
+
+processed_file = 'Processed_order_data.xlsx'  # Replace with your file path
+
+
+df2= pd.read_excel(processed_file)
+# Aggregate warehouse_id to one value per customer_id in df2 (take the first occurrence)
+df2_aggregated = df2.groupby('customer_id')['warehouse_id'].first().reset_index()
+
+# Merge the dataframes on 'customer_id' to preserve df1's row count
+merged_df = pd.merge(df1, df2_aggregated[['customer_id', 'warehouse_id']],
+                     on='customer_id', how='left')
+
+# Display the result
+print(merged_df)
+print("Merge complete.")
+merged_df.to_excel('merged_customer_orders_final.xlsx', index=False)
+print("Merge complete. Check 'merged_customer_orders.xlsx' for the result.")
+import pandas as pd
+import ast
+
+# Load the Excel file
+df = pd.read_excel('merged_customer_orders_final.xlsx')
+
+# Print the first few rows of the relevant column to diagnose
+print("First 5 rows of predicted_items_quantities:")
+print(df['predicted_items_quantities'].head().to_string())
+
+# Convert string representations of lists to actual lists if needed
+df['predicted_items_quantities'] = df['predicted_items_quantities'].apply(
+    lambda x: ast.literal_eval(x) if isinstance(x, str) else x
+)
+
+# Extract unique item names from predicted_items_quantities
+item_names = set()
+for items in df['predicted_items_quantities']:
+    if isinstance(items, list):
+        for item, _ in items:
+            item_names.add(item)
+item_names = sorted(list(item_names))  # 607 unique items
+if not item_names:
+    raise ValueError("No valid item names found in predicted_items_quantities. Check the data.")
+print(f"Found {len(item_names)} unique item names: {item_names[:5]}...")  # Print first 5 for verification
+
+item_encoding = {item: idx for idx, item in enumerate(item_names)}  # Label encode 0 to 606
+
+# Create a new DataFrame with warehouse_ids as index and item_names as columns
+warehouse_ids = sorted(df['warehouse_id'].unique())  # Should be [1, 2, 3, 4, 5, 6]
+if not warehouse_ids:
+    raise ValueError("No warehouse_ids found. Check the data.")
+print(f"Found warehouse_ids: {warehouse_ids}")
+result_df = pd.DataFrame(0, index=warehouse_ids, columns=item_names)
+
+# Function to sum quantities for a given row's predicted_items_quantities
+def sum_quantities(items):
+    if isinstance(items, list):
+        return sum(qty for _, qty in items)
+    return 0
+
+# Aggregate quantities by warehouse_id and item_name
+for idx, row in df.iterrows():
+    warehouse_id = row['warehouse_id']
+    items = row['predicted_items_quantities']
+    if isinstance(items, list):
+        for item, qty in items:
+            result_df.at[warehouse_id, item] += qty
+
+# Verify the DataFrame has columns before adding the label-encoded row
+if result_df.empty or result_df.columns.empty:
+    raise ValueError("Result DataFrame is empty or has no columns. Aggregation may have failed.")
+print("Aggregation completed. Sample of result_df:\n", result_df.head().to_string())
+
+# Add label encoded column numbers as a new row
+label_encoded_row = [item_encoding[item] for item in item_names]
+result_df.loc['label_encoded'] = label_encoded_row
+
+# Save the result to a new Excel file
+result_df.to_excel('label_encoded_warehouse_quantities.xlsx')
+print("Label encoding and aggregation complete. Check 'label_encoded_warehouse_quantities.xlsx' for the result.")
