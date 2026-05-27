@@ -1,0 +1,134 @@
+import pandas as pd
+import numpy as np
+from lightgbm import LGBMClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+from datetime import datetime, timedelta
+
+# Input parameters
+start_date_str = input("Enter start date (YYYY-MM-DD): ")
+end_date_str = input("Enter end date (YYYY-MM-DD): ")
+
+# Convert input dates to datetime
+start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+
+# Generate date range
+date_range = [start_date + timedelta(days=x) for x in range((end_date - start_date).days + 1)]
+days = [date.strftime('%A') for date in date_range]  # Day names for the range
+
+# Get unique customer_ids from sorted_df
+customer_ids = sorted_df['customer_id'].unique()
+
+# Define fixed threshold value
+threshold = 0.2
+
+# Initialize a list to store all predictions
+all_predictions = []
+
+# Fit LabelEncoder on all possible days once (for consistency across all customers)
+label_encoder = LabelEncoder()
+label_encoder.fit(days)  # Fit on the full set of days in the prediction range
+
+# Process each customer_id
+for customer_id in customer_ids:
+    # Filter data for the given customer_id
+    customer_data = sorted_df[sorted_df['customer_id'] == customer_id].copy()
+
+    # Feature Engineering
+    # Convert order_date to datetime
+    customer_data['order_date'] = pd.to_datetime(customer_data['order_date'])
+
+    # Calculate days since first order for historical data
+    first_order_date = customer_data['order_date'].min() if not customer_data.empty else start_date
+    customer_data['days_since_first_order'] = (customer_data['order_date'] - first_order_date).dt.days
+
+    # Create a dataset for all historical days
+    historical_dates = pd.date_range(start=customer_data['order_date'].min() if not customer_data.empty else start_date,
+                                    end=customer_data['order_date'].max() if not customer_data.empty else end_date,
+                                    freq='D')
+    historical_series = pd.Series(historical_dates)
+    historical_df = pd.DataFrame({
+        'date': historical_dates,
+        'day_name': [d.strftime('%A') for d in historical_dates],
+        'ordered': [1 if pd.to_datetime(d).date() in customer_data['order_date'].dt.date.values else 0 for d in historical_series]
+    })
+
+    # Check if there are enough samples
+    if len(historical_df) < 2:
+        prediction_df = pd.DataFrame({
+            'customer_id': customer_id,
+            'date': date_range,
+            'day_name': days,
+            'probability_of_order': 0.0,
+            'predicted_order': 0
+        })
+    else:
+        # Encode day_name
+        historical_df['day_name_encoded'] = label_encoder.transform(historical_df['day_name'])
+
+        # Add days since first order as a feature
+        historical_df['days_since_first_order'] = (historical_df['date'] - first_order_date).dt.days
+
+        # Add lagged feature
+        historical_df['ordered_yesterday'] = historical_df['ordered'].shift(1).fillna(0)
+
+        # Prepare features and target
+        X = historical_df[['day_name_encoded', 'days_since_first_order', 'ordered_yesterday']]
+        y = historical_df['ordered']
+
+        # Split data into train and test sets
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Initialize LightGBM model with regularization to prevent overfitting
+        model = LGBMClassifier(random_state=42, verbose=-1, max_depth=5, lambda_l2=1.0)
+
+        # Train the model
+        model.fit(X_train, y_train)
+
+        # Dynamic cross-validation based on class distribution and sample size
+        class_counts = y_train.value_counts()
+        cv_folds = min(5, len(X_train), min(class_counts)) if not class_counts.empty and min(class_counts) > 0 else 1
+        if cv_folds < 2:
+            cv_accuracy = None
+        else:
+            cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds)
+            cv_accuracy = cv_scores.mean()
+
+        # Predict on test set and evaluate accuracy
+        y_pred = model.predict(X_test)
+        test_accuracy = accuracy_score(y_test, y_pred) if len(y_test) > 0 else None
+
+        # Prepare prediction dataset
+        prediction_df = pd.DataFrame({
+            'customer_id': customer_id,
+            'date': date_range,
+            'day_name': days
+        })
+        prediction_df['day_name_encoded'] = label_encoder.transform(prediction_df['day_name'])
+        prediction_df['days_since_first_order'] = (prediction_df['date'] - first_order_date).dt.days
+        prediction_df['ordered_yesterday'] = 0  # Assume no order on the day before start date
+
+        # Predict probabilities
+        X_pred = prediction_df[['day_name_encoded', 'days_since_first_order', 'ordered_yesterday']]
+        probabilities = model.predict_proba(X_pred)[:, 1]  # Probability of class 1 (ordered)
+        prediction_df['probability_of_order'] = probabilities
+
+        # Apply fixed threshold to get binary prediction
+        prediction_df['predicted_order'] = (prediction_df['probability_of_order'] >= threshold).astype(int)
+
+    # Append predictions to the list
+    all_predictions.append(prediction_df)
+
+# Concatenate all predictions into a single DataFrame
+all_predictions_df = pd.concat(all_predictions, ignore_index=True)
+
+# Save to a single Excel file with all data
+output_filename = 'all_order_predictions.xlsx'
+all_predictions_df.to_excel(output_filename, index=False)
+print(f"All predictions saved to {output_filename}")
+
+# Optional: Trigger download in a Jupyter environment
+from IPython.display import FileLink
+display(FileLink(output_filename))
